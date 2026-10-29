@@ -1,0 +1,12 @@
+cache/
+out/
+broadcast/
+__pycache__/
+.pytest_cache/
+.worktrees/
+# scratch output of local runs (the committed reports and data stay tracked)
+reports/replay.csv
+data/hist_shards/
+reports/hist/*.log
+reports/hist/DONE
+reports/shards_*/

@@ -1,0 +1,140 @@
+--- a/src/trueo/hook/TruthMarketHook.sol
++++ b/src/trueo/hook/TruthMarketHookDemo.sol
+@@ -21,8 +21,10 @@
+ import {IPausablePool} from "./interfaces/IPausablePool.sol";
+ import {TransientSlot} from "./libraries/TransientSlot.sol";
+ import {Roles} from "./libraries/Roles.sol";
++import {ITrueoRebalancer} from "../../interfaces/ITrueoRebalancer.sol";
++import {RebalanceFlag} from "../../libraries/RebalanceFlag.sol";
+
+-contract TruthMarketHook is BaseHook, AccessControl, IPausablePool {
++contract TruthMarketHookDemo is BaseHook, AccessControl, IPausablePool {
+     using SafeCast for uint256;
+     using StateLibrary for IPoolManager;
+     using TransientSlot for TransientSlot.Int256Slot;
+@@ -41,6 +43,34 @@
+     mapping(address => bool) public authorizedPoolInitializers;
+     mapping(PoolId => bool) public override poolPaused;
+
++    // Rebalancer (demo addition) ////////////////////////////////////
++
++    ITrueoRebalancer public rebalancer;
++    uint32 public rebalanceGas;
++    /// @notice Gas kept for the rest of the trader's transaction when the rebalancer is called
++    uint32 public rebalanceGasReserve = 1_000_000;
++    /// @notice Least gas worth forwarding: the rebalancer is called only when gasleft() - reserve reaches this.
++    /// Default 750,000: above the most module gas measured over the hook's swap history (710k); the recommended
++    /// rebalanceGas is 1,500,000.
++    uint32 public rebalanceGasMin = 750_000;
++    /// @notice Lowest rebalanceGasReserve the admin can set, so that no setting can make a trader's swap revert.
++    /// Measured on a Base fork (block 53172900, real AERO and PUMP markets, PoolSwapTest router, every account cold,
++    /// a rebalancer burning all it gets, rebalanceGasMin 0, tightest gas limits): a single swap needs at most
++    /// 56,640 gas after the call returns (rest of afterSwap + PoolManager + router settlement; AERO buy YES 56,640,
++    /// AERO sell YES 55,663, PUMP buy NO 56,640, PUMP sell NO 54,687; 1k resolution). Floor = 2 x 56,640 rounded
++    /// up to 50k.
++    /// Not covered by the floor: later hops of a route (a hop 2 filling an OrderManager order needed 342,773), which
++    /// is why the opt-in goes on the last Trueo hop only and the default reserve stays 1,000,000.
++    uint32 public constant MIN_REBALANCE_GAS_RESERVE = 150_000;
++
++    error InvalidRebalancer();
++    error RebalanceGasReserveBelowFloor(uint32 reserve, uint32 floor);
++
++    event RebalancerUpdated(address indexed oldRebalancer, address indexed newRebalancer);
++    event RebalanceGasUpdated(uint32 oldGas, uint32 newGas);
++    event RebalanceGasReserveUpdated(uint32 oldReserve, uint32 newReserve);
++    event RebalanceGasMinSet(uint32 rebalanceGasMin);
++
+     // Errors ////////////////////////////////////////////////////////
+
+     error InvalidRecipient();
+@@ -117,7 +147,44 @@
+         SwapParams calldata params,
+         BalanceDelta delta,
+         bytes calldata hookData
+-    ) internal override returns (bytes4, int128) {
++    ) internal override returns (bytes4 selector, int128 hookDelta) {
++        (selector, hookDelta) = _afterSwapTrueo(sender, key, params, delta, hookData);
++        // Demo addition: last step, after validator, movePoolTick and fee. Any failure reverts only the rebalancer.
++        // Only a swap whose hookData ends with the opt-in word calls it; without it the hook is the original.
++        address r = address(rebalancer);
++        if (r != address(0) && RebalanceFlag.isSet(hookData)) {
++            // Gas: the rebalancer gets g = min(rebalanceGas, gasleft() - reserve), and is called only if g != 0 and
++            // g >= rebalanceGasMin (if g is too little the rebalancer runs out of gas and only its call reverts), so
++            // rebalanceGas = 0 or < rebalanceGasMin means no call at all. Whatever it burns, the hook keeps about the
++            // reserve (the call is passed at most gasleft() - reserve, less the few hundred gas spent before the CALL;
++            // the 63/64 rule only leaves more), so the reserve must cover everything after this call: the rest of
++            // afterSwap, the PoolManager, the router's settlement and any later swap of the transaction with the
++            // OrderManager fills it triggers (the setter enforces MIN_REBALANCE_GAS_RESERVE for the single-swap part).
++            // Integration rule: put the opt-in word only on the LAST Trueo hop of a route.
++            uint256 left = gasleft();
++            uint256 reserve = rebalanceGasReserve;
++            uint256 g = left > reserve ? left - reserve : 0;
++            uint256 cap = rebalanceGas;
++            if (g > cap) g = cap;
++            if (g != 0 && g >= rebalanceGasMin) {
++                bytes memory data = abi.encodeCall(ITrueoRebalancer.onSwap, (key));
++                // Low-level call: no extcodesize check (an address whose code vanished must not revert the swap),
++                // result and returndata ignored.
++                assembly ("memory-safe") {
++                    pop(call(g, r, 0, add(data, 0x20), mload(data), 0, 0))
++                }
++            }
++        }
++    }
++
++    /// @dev The original TruthMarketHook._afterSwap body, unchanged.
++    function _afterSwapTrueo(
++        address sender,
++        PoolKey calldata key,
++        SwapParams calldata params,
++        BalanceDelta delta,
++        bytes calldata hookData
++    ) internal returns (bytes4, int128) {
+         // Validate swap first if validator is set
+         if (address(swapValidator) != address(0)) {
+             swapValidator.validateAfterSwap(sender, key, params, delta, hookData);
+@@ -167,6 +234,44 @@
+
+     // Admin functions ////////////////////////////////////////////////
+
++    /// @notice Set the rebalancer called at the end of afterSwap (zero disables it)
++    /// @param _rebalancer A contract, or address(0)
++    function setRebalancer(address _rebalancer) external onlyRole(DEFAULT_ADMIN_ROLE) {
++        if (_rebalancer != address(0) && _rebalancer.code.length == 0) revert InvalidRebalancer();
++        address old = address(rebalancer);
++        rebalancer = ITrueoRebalancer(_rebalancer);
++        emit RebalancerUpdated(old, _rebalancer);
++    }
++
++    /// @notice Set the gas forwarded to the rebalancer
++    /// @param _gas Gas limit of the rebalancer call
++    function setRebalanceGas(uint32 _gas) external onlyRole(DEFAULT_ADMIN_ROLE) {
++        uint32 old = rebalanceGas;
++        rebalanceGas = _gas;
++        emit RebalanceGasUpdated(old, _gas);
++    }
++
++    /// @notice Set the gas the hook keeps for the rest of the trader's transaction when it calls the rebalancer
++    /// @param _reserve Kept back from the rebalancer: it gets at most gasleft() - _reserve. Must cover all the
++    /// trader's work after the call (rest of the swap, settlement, later swaps of the route). At least
++    /// MIN_REBALANCE_GAS_RESERVE (the measured single-swap need x 2); routes need more (default 1,000,000).
++    function setRebalanceGasReserve(uint32 _reserve) external onlyRole(DEFAULT_ADMIN_ROLE) {
++        if (_reserve < MIN_REBALANCE_GAS_RESERVE) {
++            revert RebalanceGasReserveBelowFloor(_reserve, MIN_REBALANCE_GAS_RESERVE);
++        }
++        uint32 old = rebalanceGasReserve;
++        rebalanceGasReserve = _reserve;
++        emit RebalanceGasReserveUpdated(old, _reserve);
++    }
++
++    /// @notice Set the least gas the hook forwards to the rebalancer
++    /// @param _min The rebalancer is called only when gasleft() - rebalanceGasReserve >= _min (it then gets
++    /// min(rebalanceGas, gasleft() - rebalanceGasReserve))
++    function setRebalanceGasMin(uint32 _min) external onlyRole(DEFAULT_ADMIN_ROLE) {
++        rebalanceGasMin = _min;
++        emit RebalanceGasMinSet(_min);
++    }
++
+     /// @notice Set the fee collector contract address
+     /// @param newCollector The new fee collector contract address
+     function setFeeCollector(address newCollector) external onlyRole(DEFAULT_ADMIN_ROLE) {
